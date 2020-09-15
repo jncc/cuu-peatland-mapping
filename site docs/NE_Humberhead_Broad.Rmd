@@ -1,0 +1,586 @@
+---
+title: "CUUPeat: Humberhead NNR - Broad-scale bare peat mapping"
+date: "15/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(raster)
+library(dplyr)
+library(sf)
+library(dplyr)
+library(tmap)
+library(stringr)
+library(JNCCsdms)
+library(tmap)
+library(purrr)
+library(gdalUtils)
+library(sp)
+
+#dependencies
+# tictoc_1.0        lubridate_1.7.4  
+# magrittr_1.5      gdalUtils_2.0.3.2
+# purrr_0.3.4       JNCCsdms_0.1.0   
+# stringr_1.4.0     tmap_3.0         
+# sf_0.9-2          dplyr_0.8.5      
+# raster_3.0-7      sp_1.4-2 
+
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Natural England site - Humberhead NNR
+Broad scale bare peat mapping processing
+
+## Site location
+
+```{r sitemap,message=F,warning=F}
+
+#site boundaries
+site <- sf::st_read('Humberhead_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('ThorneandHatfield_S2_AOI.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('ThorneandHatfield_APGB_AOI.shp',quiet=T)
+
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green") +
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+## Preparing Variable layers
+
+### DTM and slope
+
+```{r dtmslopevars, eval = FALSE}
+
+projfolder <- 'PeatlandCondition/'
+
+#crop dtm to AOI
+dtm <- raster::raster('UK_DEM_Composite_10m_WGS84.tif')
+AOI= sf::st_read(paste0(projfolder,'Data/Site_AOIs/NE_ThorneHatfield/ThorneandHatfield_S2_AOI.shp'),quiet=T)
+
+# reproject AOI
+AOI_WGS84 <- AOI %>% sf::st_transform(4326)
+
+#crop to dtm
+dtm_crop <-raster::crop(dtm,AOI_WGS84)
+dtm_bng <- raster::projectRaster(dtm_crop, crs=sp::CRS('+init=epsg:27700'), method='bilinear')
+raster::writeRaster(dtm_bng,paste0(projfolder,'NE_HumberheadNNR/Variable_layers/NE_HNNR_dtm.tif'),overwrite=T)
+
+# we can then create a slope layer using gdalutils
+gdalUtils::gdal_setInstallation()
+gdalUtils::gdaldem(mode="slope",
+                     input_dem=paste0(projfolder,'NE_HumberheadNNR/Variable_layers/NE_HNNR_dtm.tif'),
+                     output=paste0(projfolder,'NE_HumberheadNNR/Variable_layers/NE_HNNR_slope.tif'),
+                    ,verbose=T)
+
+```
+
+### Climate layers
+
+```{r prepclimate,eval=F}
+#list all data files from met office
+met_files <- data.frame(files=list.files("MetOffice_HadUK_monthly_grid_1km/",pattern='.nc'))
+#subset to seasonal records
+met_season <- met_files %>% dplyr::filter(stringr::str_detect(files, "Seas"))
+#iterate through taking just the summer season data
+out<- purrr:::map(met_season$files,function(metlayer){
+  met_raw <- raster::brick(paste0("MetOffice_HadUK_monthly_grid_1km/",as.character(metlayer)))
+  summer <- met_raw[[3]]
+  summer_crop <-raster::crop(summer,AOI)
+  #get filename of measure and year
+  filename_split <- stringr::str_split(gsub(as.character(metlayer),pattern="Had",replacement="_Had"),pattern='_')
+filename <- paste0(stringr::str_extract(as.character(filename_split[[1]][4]),'\\d{4}'),'_',filename_split[[1]][2])
+#write out
+  raster::writeRaster(summer_crop, paste0(projfolder,'NE_HumberheadNNR/Variable_layers/NE_HNNR_',filename,'.tif'),overwrite=T)
+  summer_crop
+})
+
+#create a mean layer for use with years without data released - 2019,2020
+vars <- c("rainfall","tas","tasmin","tasmax")
+# iterate through each variable
+all <- purrr::map(vars, .f=function(var){
+  varfiles <- list.files(paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),full.name=T,pattern=var) # list all files in that folder for variable
+  varfiles_r <- purrr::map(varfiles, raster::raster) #load
+  varstack <- raster::stack(varfiles_r) #stack 
+  varmean <- raster::calc(varstack,mean) #mean
+  raster::writeRaster(varmean,paste0(projfolder,'NE_HumberheadNNR/Variable_layers/NE_HNNR_mean_',var,'.tif')) #write out
+})
+
+
+```
+
+### Sentinel imagery and calculating indices
+
+extraction time series: 
+* S2A_20160420_lat54lon066_T30UXE_ORB037_utm30n_osgb	2016-04-20
+* S2A_20170505_lat54lon066_T30UXE_ORB037_utm30n_osgb	2017-05-05
+* s3://sentinel-s2-l2a/tiles/30/U/XE/2018/7/1/0	      2018-07-01
+
+Modelling time series:
+* 2015	S2A_20150930_lat54lon066_T30UXE_ORB137_utm30n_osgb	2015-09-30
+* 2016	S2A_20160719_lat54lon066_T30UXE_ORB037_utm30n_osgb	2016-07-19
+* 2017	S2A_20170505_lat54lon066_T30UXE_ORB037_utm30n_osgb	2017-05-05
+* 2018	s3://sentinel-s2-l2a/tiles/30/U/XE/2018/7/1/0	      2018-07-01
+* 2019	S2A_20190823_lat54lon066_T30UXE_ORB037_utm30n_osgb	2019-08-23
+* 2020	S2A_20200625_lat54lon066_T30UXE_ORB137_utm30n_osgb	2020-06-25
+
+```{r, eval=F}
+
+options("rgdal_show_exportToProj4_warnings"="none")
+source("s2_processing.R")
+source("FunctionRunIndices.R")
+projfolder <- 'PeatlandCondition/'
+
+#prep and crop sentinel imagery to new AOI
+tictoc::tic()
+s2_processing(s2path=paste0(projfolder, "Data/Sentinel-2/NE_ThorneHatfield/"),
+              out_folder = paste0(projfolder, "NE_HumberheadNNR/Variable_layers/"),
+              nirband=8,rband=3,bband=1,gband=2,swirband=9,
+              indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+              cropAOI=paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'))
+
+# finished message
+sink(fs::path(projfolder, 'FINISHED.txt'))
+lubridate::now()
+tictoc::toc()
+sink()
+
+```
+
+## Compiling Variable Stacks
+
+```{r,eval=F}
+library(raster)
+options("rgdal_show_exportToProj4_warnings"="none")
+source("sat_varstack.R")
+
+projfolder <- 'PeatlandCondition/'
+
+# create varstacks and mask
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+
+tictoc::tic()
+# Time series
+
+# extraction time series: varstack: 2016-04-20
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20160420_lat54lon066_T30UXE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_2016_rainfall.tif',
+                    'NE_HNNR_2016_tas.tif',
+                    'NE_HNNR_2016_tasmin.tif',
+                    'NE_HNNR_2016_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2016_04')
+
+# extraction and modelling time series: 2017-05-05 
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20170505_lat54lon066_T30UXE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_2017_rainfall.tif',
+                    'NE_HNNR_2017_tas.tif',
+                    'NE_HNNR_2017_tasmin.tif',
+                    'NE_HNNR_2017_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2017')
+
+
+# extraction and modelling time series: 2018-07-01
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20180701_lat54lon066_T30UXE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_2018_rainfall.tif',
+                    'NE_HNNR_2018_tas.tif',
+                    'NE_HNNR_2018_tasmin.tif',
+                    'NE_HNNR_2018_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2018')
+
+
+# modelling time series: varstack: 2015-09-30 
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20150930_lat54lon066_T30UXE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_2015_rainfall.tif',
+                    'NE_HNNR_2015_tas.tif',
+                    'NE_HNNR_2015_tasmin.tif',
+                    'NE_HNNR_2015_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2015')
+
+# modelling time series: 2016-07-19 
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20160719_lat54lon066_T30UXE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_2016_rainfall.tif',
+                    'NE_HNNR_2016_tas.tif',
+                    'NE_HNNR_2016_tasmin.tif',
+                    'NE_HNNR_2016_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2016_07')
+
+# modelling time series: 2019-08-23
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20190823_lat54lon066_T30UXE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_mean_rainfall.tif',
+                    'NE_HNNR_mean_tas.tif',
+                    'NE_HNNR_mean_tasmin.tif',
+                    'NE_HNNR_mean_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2019')
+
+# modelling time series: 2020-06-25
+sat_varstack(varpath = paste0(projfolder,'NE_HumberheadNNR/Variable_layers/'),
+             satimg='SEN2_20200625_lat54lon066_T30UXE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Thorne_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_HNNR_mean_rainfall.tif',
+                    'NE_HNNR_mean_tas.tif',
+                    'NE_HNNR_mean_tasmin.tif',
+                    'NE_HNNR_mean_tasmax.tif',
+                    'NE_HNNR_slope.tif'),
+             mask= paste0(projfolder,'NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp'),
+             outpath = paste0(projfolder, 'NE_HumberheadNNR/Time_series_modelling/Varstacks/'),
+             stackname='NE_HNNR_2020')
+
+# finished message
+sink(fs::path(projfolder, 'FINISHED.txt'))
+lubridate::now()
+tictoc::toc()
+sink()
+```
+
+## Extracting training data
+
+```{r,eval=F}
+
+library(raster)
+library(magrittr)
+options("rgdal_show_exportToProj4_warnings"="none")
+source("train_extract.R")
+projfolder <- 'PeatlandCondition/'
+
+tictoc::tic()
+
+# Hatfield
+# 2016-04-20
+train_extract(varstack=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Varstacks/NE_HNNR_2016_04.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/bare_pcov_mosaic_hatfield_2016.tif'),
+              outfolder=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+# 2018-07-01
+train_extract(varstack=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Varstacks/NE_HNNR_2018.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/bare_pcov_mosaic_hatfield_2018.tif'),
+              outfolder=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+# Thorne
+
+# 2016-04-20
+train_extract(varstack=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Varstacks/NE_HNNR_2016_04.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/bare_pcov_mosaic_thorne_2016.tif'),
+              outfolder=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+# 2017-05-05
+train_extract(varstack=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Varstacks/NE_HNNR_2017.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/bare_pcov_mosaic_thorne_2017.tif'),
+              outfolder=paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+# finished message
+sink(fs::path(projfolder, 'FINISHED.txt'))
+lubridate::now()
+tictoc::toc()
+sink()
+```
+
+
+
+## Running the time series regression models - several trials running with different test data combinations
+
+### Thorne 2016 and 2017
+
+```{r, eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+training1 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_thorne.csv")) %>% dplyr::select(-X)
+training2 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2017_thorne.csv")) %>% dplyr::select(-X)
+alltrain <- rbind(training1,training2)
+write.csv(alltrain,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_thorne_2016_2017.csv"))
+
+## look at how many per category
+alltrain %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+
+## covariate analysis
+varstack <- raster::stack(paste0(projfolder,'NE_HumberheadNNR/Time_series_modelling/Varstacks/probablepeat/NE_HNNR_2017.tif'))
+names(varstack) <-c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope')
+# run  function to see how the variables correlate
+JNCCsdms::corrVars(varstack)
+
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_thorne_2016_2017.csv"),
+      varpredict=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/thorne_2016_2017/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=5000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# assessing change over time
+dir.create(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/thorne_2016_2017/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/thorne_2016_2017/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:5],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:6],names(pred_tifs)[6]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_HumberheadNNR',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/thorne_2016_2017/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+
+```
+
+
+### Hatfield 2018
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+hatfield<- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2018_hatfield.csv"))
+
+## look at how many per category
+hatfield %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2018_hatfield.csv"),
+      varpredict=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2018/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# assessing change over time
+dir.create(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2018/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2018/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:4],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:5],names(pred_tifs)[5]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_HumberheadNNR',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2018/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+```
+
+
+### Hatfield 2016
+
+```{r, eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+hatfield2016 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_hatfield.csv")) 
+## look at how many per category
+hatfield2016 %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_hatfield.csv"),
+      varpredict=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# assessing change over time
+dir.create(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:5],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:6],names(pred_tifs)[6]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_HumberheadNNR',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+```
+
+
+### Hatfield 2016 + 2018
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+hatfield2016 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_hatfield.csv")) %>% dplyr::select(-X)
+hatfield2018<- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2018_hatfield.csv"))%>% dplyr::select(-X)
+
+alltrain <- rbind(hatfield2016,hatfield2018)
+write.csv(alltrain,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_hatfield_2016_2018.csv"))
+
+## look at how many per category
+alltrain %>% group_by(barecat) %>% summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_hatfield_2016_2018.csv"),
+      varpredict=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016_2018/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# assessing change over time
+dir.create(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016_2018/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016_2018/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:5],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:6],names(pred_tifs)[6]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_HumberheadNNR',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/Hatfield_2016_2018/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+```
+
+
+### Hatfield 2016 and 2018 and Thorne 2016 and 2017
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+thorne1 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_thorne.csv")) %>% dplyr::select(-X)
+thorne2 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2017_thorne.csv")) %>% dplyr::select(-X)
+hatfield1 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2016_04_hatfield.csv")) %>% dplyr::select(-X)
+hatfield2 <- read.csv(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_2018_hatfield.csv")) %>% dplyr::select(-X)
+alltrain <- rbind(thorne1,thorne2,hatfield1,hatfield2)
+write.csv(alltrain,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_hatfield&thorne_all.csv"))
+
+## look at how many per category
+alltrain %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Training_data/NE_HNNR_hatfield&thorne_all.csv"),
+      varpredict=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/hatfield&thorne_all/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# assessing change over time
+dir.create(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/hatfield&thorne_all/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/hatfield&thorne_all/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:5],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:6],names(pred_tifs)[6]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_HumberheadNNR',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_HumberheadNNR/Time_series_modelling/RegressionModels/hatfield&thorne_all/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+
+```
+
+
+
+
+
+

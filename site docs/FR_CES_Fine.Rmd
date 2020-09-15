@@ -1,0 +1,280 @@
+---
+title: "CUUPeat: Caithness and East Sutherland, Scotland - Fine-scale bare peat mapping"
+date: "14/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(sf)
+library(purrr)
+library(tmap)
+library(dplyr)
+library(raster)
+
+#package dependencies
+## purrr_0.3.4       tmap_3.0          sf_0.9-2         
+## dplyr_0.8.5       raster_3.0-7     
+
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Forest Research site - Caithness and East Sutherland, Scotland
+Fine-scale bare peat mapping processing
+
+
+## Site location
+
+```{r sitemap,message=F,warning=F}
+
+#site boundaries
+site <- sf::st_read('CES_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('Dalchork_S2_AOI_clipped.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('Dalchork_APGB_AOI.shp',quiet=T)
+
+library(tmap)
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green") +
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+
+##  Preparing the APGB
+
+For the CES site, there were APGB imagery available from:
+
+* 2015-09-29
+* 2015-09-30
+* 2016-05-10
+* 2016-06-01
+* 2016-06-06
+* 2016-10-09
+* 2019-09-21
+
+```{r apgb_latest, include=T,message=F,warning=F,fig.show = "hold", out.width = "50%", fig.align = "default", eval=F}
+
+## Processing the latest APGB
+dirpath <- "FR_CES/"
+
+#run function to resample nir band from image b, and combine with image a. the nir argument specifys which band is the nir band in image b and the start and end arguments are for iterating between many data files. 
+
+AOIs <- list.files(paste0(dirpath,"25cm Aerial Photo/"))
+purrr::map(AOIs,.f=function(shape){
+  comboAPGB(a.path=paste0(dirpath,"25cm Aerial Photo/",shape,"/"),
+          b.path=paste0(dirpath,"50cm Colour Infrared/",gsub(shape,pattern="1_RGB",replacement="2_CIR"),"/"),
+          nir=1,
+          out.path=paste0(dirpath,"FR_CES_Combined/"),
+          start=1,end=NULL)
+})
+
+## rename files with dates
+date_lookup <- 'CIR_Date_Grid.shp'
+
+APGBdate(imgfolder=paste0(dirpath,'Combined/111811_Shape1/'),
+         lookup=date_lookup)
+APGBdate(imgfolder=paste0(dirpath,'Combined/111811_Shape2/'),
+         lookup=date_lookup)
+APGBdate(imgfolder=paste0(dirpath,'Combined/111811_Shape3/'),
+         lookup=date_lookup)
+APGBdate(imgfolder=paste0(dirpath,'Combined/111811_Shape4/'),
+         lookup=date_lookup)
+```
+
+## Creating fine scale maps
+
+## Imagery Site 1 - 2016 - 232 tiles 
+
+### Mask APGB imagery to peat soils and remove any tiles not over peat soils
+
+```{r,eval=F}
+# copy folder contents
+file.copy("FR_CES/Combined/111811_Shape1",
+          "FR_CES/Fine_scale_mapping/Masked",recursive=T)
+
+# function will check if a tile overlaps with the peat soils boundary layer. if it does then the tile is masked to the peat soils and masked img is overwritten, if it doesnt then file is deleted.
+
+MaskPeatSoils(img_folder='FR_CES/Fine_scale_mapping/Masked/',
+              mask='FR_CES/Shapefiles/CES_Site_Boundaries.shp',
+              delete=T)
+length(list.files('FR_CES/Fine_scale_mapping/Masked/'))
+
+```
+
+### explore differences in bare and vegetated peat signatures and thresholds (done in Peatpal)
+
+### Testing out thresholding rules on several tiles
+```{r, eval=F}
+## test out a thresholding rule on a tile 2016-06-06_NC5620
+img_folder <- 'FR_CES/Fine_scale_mapping/Masked/'
+#load in layers
+img <- '2016-06-06_NC5620'
+#create indices layer
+runIndices(imagepath=paste0(img_folder,img,'.tif'),
+            outpath=img_folder,
+            nir=4,r=1, b=3, g=2,
+            indices=c("Brightness","NDVI","RG", "NDWI"), nf=T)
+#indices
+indices <- c(paste0(img_folder,"Indices/", img, "/",img,"_Brightness.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDVI.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_RG.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDWI.tif"))
+indlist <- purrr::map(indices,.f=raster::raster)
+layer_stack <- raster::stack(indlist)
+
+
+#x1 = brightness, x2 = NDVI, x3 = RG,x4=NDWI 
+thresh_fun <- function(x1,x2,x3,x4) {
+  ifelse(x1 >50 & x1 <95 & x2 < 0.2 & x3 > 0.9 & x4 < 0.1 , 1, NA) 
+}
+
+#Apply function to raster stack
+r.class <- raster::overlay(layer_stack, fun=thresh_fun)
+
+if(!dir.exists(paste0(img_folder,"bare"))){
+  dir.create(paste0(img_folder,"bare"))
+}
+raster::writeRaster(r.class,paste0(img_folder,"bare/",img,"_Bare.tif"),overwrite=T)
+##---------------------------------------------###
+## test out a thresholding rule on a tile 2016-06-01_NC5619
+#load in layers
+img <- '2016-06-01_NC5619'
+#create indices layer
+runIndices(imagepath=paste0(img_folder,img,'.tif'),
+            outpath=img_folder,
+            nir=4,r=1, b=3, g=2,
+            indices=c("Brightness","NDVI","RG", "NDWI"), nf=T)
+#indices
+indices <- c(paste0(img_folder,"Indices/", img, "/",img,"_Brightness.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDVI.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_RG.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDWI.tif"))
+indlist <- purrr::map(indices,.f=raster::raster)
+#nir band
+nir <- raster::raster('2016-06-01_NC5619.tif', band=4)
+indlist <- append(indlist,nir)
+layer_stack <- raster::stack(indlist)
+
+
+#x1 = brightness, x2 = NDVI, x3 = RG,x4=NDWI ,x5 = nir
+thresh_fun <- function(x1,x2,x3,x4,x5) {
+  ifelse(x1 >75 & x1 <101 & x2 < 0.2 & x3 > 0.9 & x4 < 0.1 & x5 <100 , 1, NA) 
+}
+
+#Apply function to raster stack
+r.class <- raster::overlay(layer_stack, fun=thresh_fun)
+
+if(!dir.exists(paste0(img_folder,"bare"))){
+  dir.create(paste0(img_folder,"bare"))
+}
+raster::writeRaster(r.class,paste0(img_folder,"bare/",img,"_Bare.tif"),overwrite=T)
+##---------------------------------------------###
+## NC5123
+#load in layers
+img <- '2016-06-06_NC5123'
+#create indices layer
+runIndices(imagepath=paste0(img_folder,img,'.tif'),
+            outpath=img_folder,
+            nir=4,r=1, b=3, g=2,
+            indices=c("Brightness","NDVI","RG", "NDWI"), nf=T)
+#indices
+indices <- c(paste0(img_folder,"Indices/", img, "/",img,"_Brightness.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDVI.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_RG.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDWI.tif"))
+indlist <- purrr::map(indices,.f=raster::raster)
+#nir band
+nir <- raster::raster('2016-06-06_NC5124.tif', band=4)
+indlist <- append(indlist,nir)
+layer_stack <- raster::stack(indlist)
+
+
+#x1 = brightness, x2 = NDVI, x3 = RG,x4=NDWI ,x5 = nir
+thresh_fun <- function(x1,x2,x3,x4,x5) {
+  ifelse(x1 >75 & x1 <112 & x2 < 0.2 & x3 > 0.9 & x4 < 0.1 & x5 <120 , 1, NA) 
+}
+
+#Apply function to raster stack
+r.class <- raster::overlay(layer_stack, fun=thresh_fun)
+
+if(!dir.exists(paste0(img_folder,"bare"))){
+  dir.create(paste0(img_folder,"bare"))
+}
+raster::writeRaster(r.class,paste0(img_folder,"bare/",img,"_Bare.tif"),overwrite=T)
+```
+
+### Trying Rule on all tiles
+
+```{r, eval=F}
+#x1=Brightness, x2=NDVI,x3 = NDWI, x4=RG
+thresh_fun <- function(x1,x2,x3,x4) {
+  ifelse(x1 >75 & x1 <110 & x2 < 0.2 & x3 < 0.1 & x4 >0.9 , 1, NA) 
+}
+
+#run thresholding rule
+barethresh(Img.path=img_folder, 
+           out.path=img_folder,
+           spec.bands=NA, #if spectral bands are included in the thresholding, the band number
+           ind.name=c("Brightness", "NDVI","NDWI","RG"), #name of indices, should be in alphabetical order and will be used in this order in the thresholding function
+           c.fun=thresh_fun, #thresholding function
+           nir=4, r=1,g=2,b=3, #band numbers within the imagery
+           start=1)
+```
+
+The results were then examined with QGIS with those tiles which didnt quite meet a good standard re-examined in Peatpal with the rule tweaked. 
+
+After showing the results to FR it was decided that the detection method wasnt quite pulling out the right features in the plantation areas. Therefore the bare peat mapping would only look at the natural peatland areas within the site, with those on the plantation being assessed in a different part of the analysis with maddie (FR). So here we kept just those areas within the natural bare peat regions.
+
+```{r,eval=F}
+img_folder <- 'FR_CES/'
+## mask to unplanted peatlands
+
+# function will check if a tile overlaps with the peat soils boundary layer. if it does then the tile is masked to the peat soils and masked img is overwritten, if it doesnt then file is deleted.
+MaskPeatSoils(img_folder=paste0(img_folder,'Fine_scale_mapping/bare/no_plant_good/'),
+              mask=paste0(img_folder,'Shapefiles/CES_Site1_nonPlanted.shp'),
+              delete=T)
+
+#mask masked tiles to new mask
+MaskPeatSoils(img_folder=paste0(img_folder,'Masked/'),
+              mask='CES_Site1_nonPlanted.shp',
+              delete=T)
+```
+
+Finally all the tiles converted in a binary classification; 0 if there was no bare peat present and 1 if there was bare peat present. This was converted to the 10m pixel level as a percentage cover per 10m of bare peat.
+
+```{r, eval=F}
+library(raster)
+dirpath <- 'FR_CES/'
+#convert into percentage covers
+pcov_classify(img_path=paste0(dirpath,'Fine_scale_mapping/Masked/'), 
+              bare_path=paste0(dirpath,'Fine_scale_mapping/bare/'),
+              out_path=paste0(dirpath,'Fine_scale_mapping/'),
+              polymask=paste0(dirpath,'Shapefiles/CES_Site1_nonPlanted.shp'))
+
+# mosaic tiles
+pcov <- list.files(paste0(dirpath,'Fine_scale_mapping/bare_pcov/'),full.names=T)
+pcov_list <- purrr::map(pcov,raster)
+names(pcov_list)<-NULL
+pcov_list$fun <- mean
+pcov_mosaic <- do.call(raster::mosaic,c(pcov_list,progress="window"))
+raster::writeRaster(pcov_mosaic,paste0(dirpath,'Fine_scale_mapping/bare_pcov_mosaic.tif'))
+
+```
+
+

@@ -1,0 +1,190 @@
+---
+title: "CUUPeat: Dark Peak, England- Fine-scale bare peat mapping"
+date: "14/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(sf)
+library(purrr)
+library(tmap)
+library(dplyr)
+library(raster)
+library(gdalUtils)
+library(stringr)
+
+#package dependencies
+## purrr_0.3.4       tmap_3.0          sf_0.9-2          stringr_1.4.0  
+## dplyr_0.8.5       raster_3.0-7      gdalUtils_2.0.3.2 
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Natural England site - Dark Peak, England
+Fine-scale bare peat mapping processing
+
+## Site location
+
+```{r}
+
+#site boundaries
+site <- sf::st_read('NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('NE_DarkPeak/DarkPeak_S2_AOI.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('NE_DarkPeak/DarkPeak_APGB_AOI.shp',quiet=T)
+
+library(tmap)
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tm_fill("green")+
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+
+## Fine-scale map from APGB
+
+For the Dark Peak site, there were APGB imagery available from:
+
+* 2018-06-27
+
+The majority of the site was previously processed during the pilot study so it was agreed to use these training data for the regression modelling and not include any further APGB imagery.
+
+
+### masking classified tiles to boundaries and renaming with dates
+
+```{r, eval=F}
+
+## find all tiles within site
+#site boundaries
+site <- sf::st_read('NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp',quiet=T)
+imagedate <- sf::st_read('CIR_Date_Grid.shp')
+
+imagedat <- sf::st_intersection(imagedate,site)
+x<- data.frame(unique(imagedat$OS))                 
+                     
+#mask to shapefiles - this was done in chunks as 564 tiles
+img_fold <- 'PeatlandCondition'
+
+MaskPeatSoils(img_folder=paste0(img_fold,'Data/APGB/NE_DarkPeak/'),
+              mask=paste0(img_fold,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp',
+              delete=T)
+
+## rename files -  modified APGB dates function
+lookup <- 'CIR_Date_Grid.shp'
+imgfolder<- paste0(img_fold,'Data/APGB/NE_DarkPeak/')
+field='OS'
+
+
+  date_lookup <- sf::st_read(lookup,quiet=T)
+  imgs <- list.files(imgfolder,pattern='tif',full.names = T)
+
+  #get dates
+  date_df <- date_lookup %>% sf::st_drop_geometry() %>% dplyr::select(field,DateFlown) %>%
+    tidyr::separate(DateFlown,'date',sep=",",extra="drop")
+  purrr::map(imgs,.f=function(imgname){
+    date <- date_df %>% dplyr::filter(get(field) == gsub(gsub(basename(imgname),pattern='.tif',replacement=""),pattern="BARE_",replacement=""))
+
+    file.rename(imgname, paste0(dirname(imgname),'/',as.character(date$date),'_',basename(imgname)))
+    imgname
+  })
+  
+  # remove class 2 and 3 from images ( previously in the pilot these represented rock and vegetation)
+  bare_path <- paste0(dirpath,'Fine_scale_mapping/bare/')
+  imgs <- list.files(bare_path,pattern='tif',full.names=T)
+  purrr::map(imgs, .f=function(tile){
+    tile_bare <- raster::raster(tile)
+    tile_bare[tile_bare==2 |tile_bare==3]<-0
+    raster::writeRaster(tile_bare,tile,overwrite=T)
+  })
+
+```
+
+At this stage, the pilot data is already up to the classed stage 
+
+```{r,eval=F}
+dirpath <- 'NE_DarkPeak/'
+
+ #### Converting to percentage cover of bare peat at 10m pixel ####
+bare_path <- paste0(dirpath,'Fine_scale_mapping/bare/')
+out_path <- paste0(dirpath,'Fine_scale_mapping/')
+polymask <- paste0(dirpath,'Fine_scale_mapping/Shapefiles/DarkPeak_Site_Boundaries.shp')
+
+#list all files
+  imgs <- list.files(bare_path,pattern='tif',full.names=T)
+  #create folders
+  if(!dir.exists(paste0(out_path,'bare_pcov'))){
+    dir.create(paste0(out_path,'bare_pcov'))
+  }
+
+  habmask <- sf::st_read(polymask)
+  
+  #iterate through bare classed tiles
+  purrr::map(imgs, .f=function(tile){
+    tile_bare <- raster::raster(tile)
+    #get tile name
+    name <- gsub(unlist(stringr::str_split(basename(tile),'_'))[3],pattern='.tif',replacement='')
+    namenobare <- gsub(basename(tile),pattern='BARE_',replacement='')
+
+    #convert NA values to 0
+    tile_bare[is.na(tile_bare)]<-0
+    raster::writeRaster(tile_bare,paste0(out_path,'bare_pcov/baretmp_',basename(tile)),overwrite=T)
+    #create a 10m pixel version of raster
+    gdalUtils::gdal_setInstallation()
+    gdalUtils::gdalwarp(srcfile = paste0(out_path,'bare_pcov/baretmp_',basename(tile)),
+                        dstfile = paste0(out_path,'bare_pcov/pcov_',basename(tile)),
+                        s_srs = 'EPSG:27700',t_srs = 'EPSG:27700',
+                        r = 'average',tr=c(10,10), overwrite = T, verbose = T)
+    #annoyingly gdalwarp doesnt summarise on sum so we will use average*pixelcellcount = sum
+    ## calculate no.cells in high res compared to low res
+    highres_count <- (10 / res(tile_bare)[1])^2
+
+    pcov_img <- raster::raster(paste0(out_path,'bare_pcov/pcov_',basename(tile)))
+    pcov_df <- raster::as.data.frame(pcov_img)
+    names(pcov_df) <- 'average'
+    pcov_df <- pcov_df %>% dplyr::mutate(sum = average*highres_count) %>%
+      dplyr::mutate(pcov = sum/highres_count)
+    pcov_r <- raster::setValues(pcov_img,values=pcov_df$pcov)
+
+    #mask to remove border effect of incomplete cells
+    pcov_mask <- raster::mask(pcov_r,habmask)
+
+    writeRaster(pcov_mask,paste0(out_path,'bare_pcov/pcov_',namenobare),
+                overwrite=T)
+    file.remove(paste0(out_path,'bare_pcov/baretmp_',basename(tile)))
+    print(paste0(name, ' done.'))
+
+    })
+
+  #mosaic together
+  pcov <- list.files(paste0(dirpath,'Fine_scale_mapping/bare_pcov/'),full.names=T)
+  pcov_list <- purrr::map(pcov,raster::raster)
+  names(pcov_list) <- NULL
+  pcov_list$fun <- mean
+  pcov_mosaic <- do.call(raster::mosaic,c(pcov_list,progress="window"))
+  raster::writeRaster(pcov_mosaic,paste0(dirpath,'Fine_scale_mapping/bare_pcov_mosaic.tif'),overwrite=T)
+                    
+                    
+```
+
+
+
+
+
+
+
+
+

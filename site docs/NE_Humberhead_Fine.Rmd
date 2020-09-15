@@ -1,0 +1,400 @@
+---
+title: "CUUPeat: Humberhead NNR - Fine-scale bare peat mapping"
+date: "15/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(sf)
+library(purrr)
+library(tmap)
+library(dplyr)
+library(raster)
+
+#package dependencies
+## purrr_0.3.4       tmap_3.0          sf_0.9-2         
+## dplyr_0.8.5       raster_3.0-7  stringr_1.4.0
+## tictoc_1.0        lubridate_1.7.4 magrittr_1.5
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Natural England site - Humberhead NNR
+Fine-scale bare peat mapping processing
+
+## Site location
+
+```{r sitemap,message=F,warning=F}
+
+#site boundaries
+site <- sf::st_read('Humberhead_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('ThorneandHatfield_S2_AOI.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('ThorneandHatfield_APGB_AOI.shp',quiet=T)
+
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green") +
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+## Preparing the APGB
+
+For the Humberhead site, there were a mixture of APGB imageery available from:
+
+Thorne:
+
+* 2016-04-20
+* 2016-04-21
+* 2017-05-25
+* 2017-05-25
+* 2019-10-20
+
+Hatfield:
+
+* 2016-04-21
+* 2016-05-05
+* 2018-07-01
+* 2019-10-20
+
+Preparing the latest site APGB imagery:
+```{r apgb_latest, include=T,message=F,warning=F,fig.show = "hold", out.width = "50%", fig.align = "default",eval=F}
+dirpath <- "PeatlandCondition/Data/APGB/WG_BB/"
+
+#run function to resample nir band from image b, and combine with image a. the nir argument specifys which band is the nir band in image b and the start and end arguments are for iterating between many data files. 
+
+AOIs <- list.files(paste0(dirpath,"25cm Aerial Photo/"))
+purrr::map(AOIs,.f=function(shape){
+  comboAPGB(a.path=paste0(dirpath,"25cm Aerial Photo/",shape,"/"),
+          b.path=paste0(dirpath,"50cm Colour Infrared/",gsub(shape,pattern="1_RGB",replacement="2_CIR"),"/"),
+          nir=1,
+          out.path=paste0(dirpath),
+          start=1,end=NULL)
+})
+
+## rename files with dates
+date_lookup <- 'CIR_Date_Grid.shp'
+
+APGBdate(imgfolder=paste0(dirpath,'combined/Shape1/'),lookup=date_lookup)
+APGBdate(imgfolder=paste0(dirpath,'combined/Shape2/'),lookup=date_lookup)
+
+
+```
+
+Preparing the second year of APGB imagery available for the site (partial coverage):
+```{r apgb_archive, include=T,message=F,warning=F,fig.show = "hold", out.width = "50%", fig.align = "default",eval=F}
+
+## Processing the latest APGB
+dirpath <- "PeatlandCondition/Data/APGB/NE_HumberheadNNR/"
+
+#run function to resample nir band from image b, and combine with image a. the nir argument specifys which band is the nir band in image b and the start and end arguments are for iterating between many data files. 
+
+AOIs <- list.files(paste0(dirpath,"25cm Aerial Photo/"))
+purrr::map(AOIs[3],.f=function(shape){
+  comboAPGB(a.path=paste0(dirpath,"25cm Aerial Photo/",shape,"/"),
+          b.path=paste0(dirpath,"50cm Colour Infrared/",gsub(shape,pattern="3_RGB",replacement="4_CIR"),"/"),
+          nir=1,
+          out.path=paste0(dirpath),
+          start=1,end=NULL)
+})
+
+#rename files
+date_lookup <- '111818-2_CIR_1_Shape_Date_Grid.shp'
+
+APGBdate(imgfolder=paste0(dirpath,'combined/111818_Shape1/'),
+         lookup=date_lookup,field='kmRef')
+APGBdate(imgfolder=paste0(dirpath,'combined/111818_Shape2/'),
+         lookup=date_lookup,field='kmRef')
+
+```
+
+## Creating fine scale maps
+
+### Mask APGB imagery to peat soils and remove any tiles not over peat soils
+
+```{r,eval=F }
+
+#site boundaries
+site <- sf::st_read('Humberhead_Site_Boundaries.shp',quiet=T)
+
+# copy folder contents
+#Thorne
+file.copy("Data/APGB/NE_HumberheadNNR/Combined/Shape1/",
+          "NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked",recursive=T)
+file.copy("Data/APGB/NE_HumberheadNNR/Combined/11818_Shape1/",
+          "NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked",recursive=T)
+#Hatfield
+file.copy("Data/APGB/NE_HumberheadNNR/Combined/Shape2/",
+          "NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Masked",recursive=T)
+file.copy("Data/APGB/NE_HumberheadNNR/Combined/11818_Shape2/",
+          "NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Masked",recursive=T)
+
+#mask to the site boundaries 
+img_folder="NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked/Shape1/"
+#img_folder="NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked/11818_Shape1/"
+#img_folder="NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Masked/Shape2/"
+#img_folder="NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Masked/11818_Shape2/"
+# masking function
+MaskPeatSoils(img_folder=img_folder,
+              mask='Humberhead_Site_Boundaries.shp',
+              delete=T)
+```
+
+## Thorne Moors ##
+
+Very difficult varied vegetation, small patches of obvious bare peat then lots of scrubby areas. 
+
+## 2019 imagery
+### Testing out threshold rules
+```{r, eval=F}
+## test out a thresholding rule on a tile 2016-06-06_NC5620
+img_folder="NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked/2019/"
+#load in layers
+img <- '2019-10-20_SE7218'
+#create indices layer
+runIndices(imagepath=paste0(img_folder,img,'.tif'),
+            outpath=img_folder,
+            nir=4,r=1, b=3, g=2,
+            indices=c("Brightness","GLI","NDVI","RG", "RB"), nf=T)
+#indices
+indices <- c(paste0(img_folder,"Indices/", img, "/",img,"_Brightness.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_GLI.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_NDVI.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_RG.tif"),
+             paste0(img_folder,"Indices/", img, "/",img,"_RB.tif"))
+indlist <- purrr::map(indices,.f=raster::raster)
+
+
+nir <- raster::raster(paste0(img_folder,img,'.tif'), band=4)
+indlist <- append(indlist,nir)
+layer_stack <- raster::stack(indlist)
+
+
+#x1 = Brightness, x2 = GLI, x3 = NDVI, x4 = RG, x5=RB 
+thresh_fun <- function(x1,x2,x3,x4,x5,x6) {
+  ifelse(x1 >30 & x1 <50 & x2 < 0 & x3 <0.5 & 
+           x4> 0.95 &
+           x5 < 1.4 & x5> 0.86 & 
+           x6<120, 1, NA) 
+}
+
+#Apply function to raster stack
+r.class <- raster::overlay(layer_stack, fun=thresh_fun)
+
+if(!dir.exists(paste0(img_folder,"bare"))){
+  dir.create(paste0(img_folder,"bare"))
+}
+raster::writeRaster(r.class,paste0(img_folder,"bare/",img,"_Bare.tif"),overwrite=T)
+```
+
+## 2017 imagery - all made using peatpal
+Found threshold rules were on a tile by tile basis and quite different so instead manually identified in qgis. Several tiles were without any bare peat, therefore a mosaic was first created and then bare peat tiles were used to update this to generate the bare peat layer.
+
+```{r, eval= F}
+img_folder="NE_HumberheadNNR/Fine_scale_mapping/Thorne/"
+mask<- sf::st_read('NE_HumberheadNNR/Shapefiles/Humberhead_Site_Boundaries.shp')
+#create mosaic layer of all tiles with nas
+alltiles <- list.files(paste0(img_folder,'Masked/2017'),pattern='.tif',full.names=T)
+tiles_r <- purrr::map(alltiles,raster,band=1)
+names(tiles_r) <- NULL
+tiles_r$fun <- mean
+rast.mosaic <- do.call(raster::mosaic,c(tiles_r,progress="window"))
+#make all values na
+rast.mosaic[!is.na(rast.mosaic)]<- NA
+
+# mosaic bare peat tiles
+baretiles <- list.files(paste0(img_folder,'Bare/2017/'),pattern='.tif',full.names=T)
+bare_r <- purrr::map(baretiles,.f=function(tif){
+  baretile <- raster::raster(tif)
+  baretile[is.na(baretile)]<-0
+  baretile
+})
+names(bare_r) <- NULL
+bare_r$fun <- mean
+bare_mosaic <- do.call(raster::mosaic,c(bare_r,progress="window"))
+bare_extended <- raster::extend(bare_mosaic,extent(rast.mosaic),value=0)
+bare_extended[is.na(bare_extended)]<-0
+bare_masked <- raster::mask(bare_extended,mask)
+
+#write out layer
+raster::writeRaster(bare_masked,paste0(img_folder,'Bare/2017/Humberhead_Thorne_mosaic_2017.tif',overwrite=T)
+                    
+                    
+
+```
+
+## 2016 imagery
+
+```{r }
+x<-data.frame(list.files('Data/APGB/NE_HumberheadNNR/combined/111818_Shape1 - Copy'))
+
+```
+
+Finally all the tiles converted in a binary classification; 0 if there was no bare peat present and 1 if there was bare peat present. This was converted to the 10m pixel level as a percentage cover per 10m of bare peat.
+
+```{r, eval=FALSE}
+
+options("rgdal_show_exportToProj4_warnings"="none")
+source("pcovClassify.R")
+
+tictoc::tic()
+#convert into percentage covers
+pcov_classify(img_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/Masked/2019/'), 
+              bare_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/Bare/2019/'),
+              out_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/'),
+              polymask=paste0(dirpath,'NE_HumberheadNNR/Shapefile/Humberhead_Site_Boundaries.shp'))
+
+# mosaic tiles
+pcov <- list.files(paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/bare_pcov/'),full.names=T)
+pcov_list <- purrr::map(pcov,raster)
+names(pcov_list)<-NULL
+pcov_list$fun <- mean
+pcov_mosaic <- do.call(raster::mosaic,c(pcov_list,progress="window"))
+raster::writeRaster(pcov_mosaic,paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Thorne/bare_pcov_mosaic.tif'))
+
+# finished message
+sink(fs::path(dirpath, 'NE_HumberheadNNR','Fine_scale_mapping', 'Thorne', 'FINISHED.txt'))
+lubridate::now()
+tictoc::toc()
+sink()
+
+```
+
+## Hatfield Moors ##
+
+## 2016 imagery
+
+### Trying out blanket rule on all tiles
+
+```{r, eval=F}
+#x1=Brightness, x2=GLI,x3=NDVI,x4 = NDWI, x4=RG
+img_folder <- 'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/2016/'
+thresh_fun <- function(x1,x2,x3,x4,x5){
+  ifelse(x1 > 50 & 
+           x1 <80 & 
+           x2 < 0.08 & 
+           x3 < 0.5 & 
+           x4 < (-0.22) & 
+           x5 >0.85 , 1, 0) 
+}
+
+#run thresholding rule
+barethresh(Img.path=paste0(img_folder,'2016/Masked/'), 
+           out.path=paste0(img_folder,'2016/'),
+           spec.bands=NA, #if spectral bands are included in the thresholding, the band number
+           ind.name=c("Brightness","GLI", "NDVI","NDWI","RG"), #name of indices, should be in alphabetical order and will be used in this order in the thresholding function
+           c.fun=thresh_fun, #thresholding function
+           nir=4, r=1,g=2,b=3, #band numbers within the imagery
+           start=1)
+```
+
+### 2018 imagery
+
+```{r, eval=F}
+img_folder <- 'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/2018/'
+#x1=NIR, x2=Brightness, x3=GLI,x4=NDVI,x5 = NDWI, x6= RB, x7=RG
+thresh_fun <- function(x1,x2,x3,x4,x5,x6,x7){
+  ifelse(x1 > 50 & 
+           x1 < 100 & 
+           x2 > 50 & 
+           x2 < 100 &
+           x3 > 0 & 
+           x3 < 0.1 &
+           x4 > (-0.15) & 
+           x4 < 0.12 &
+           x5 > (-0.1) &
+           x5 < 0.15 &
+           x6 > 1 &
+           x6 < 1.5 &
+           x7 > 0.8 &
+           x7 < 1.1
+         , 1, 0) 
+}
+```
+ 
+```{r, eval=F}
+#run thresholding rule
+barethresh(Img.path=img_folder, 
+           out.path=img_folder,
+           spec.bands=4, #if spectral bands are included in the thresholding, the band number
+           ind.name=c("Brightness","GLI", "NDVI","NDWI","RB","RG"), #name of indices, should be in alphabetical order and will be used in this order in the thresholding function
+           c.fun=thresh_fun, #thresholding function
+           nir=4, r=1,g=2,b=3, #band numbers within the imagery
+           start=1)
+```
+
+###  2019 imagery
+
+```{r, eval=F}
+img_folder <- 'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/2019/'
+
+#x1=Brightness, x2=GLI,x3=NDVI,x4 = NDWI, x5= RB, x6=RG
+thresh_fun <- function(x1,x2,x3,x4,x5,x6){
+  ifelse(x1 > 30 & 
+           x1 <50 & 
+           x2 < 0.01 & 
+           x3 < 0.6 & 
+           x4 < 0.4 & 
+           x5 <1.3 &
+           x6>0.9
+        , 1, 0) 
+}
+
+#run thresholding rule
+barethresh(Img.path=paste0(img_folder,'Masked/'), 
+           out.path=paste0(img_folder,'bare/'),
+           spec.bands=NA, #if spectral bands are included in the thresholding, the band number
+           ind.name=c("Brightness","GLI", "NDVI","NDWI","RB","RG"), #name of indices, should be in alphabetical order and will be used in this order in the thresholding function
+           c.fun=thresh_fun, #thresholding function
+           nir=4, r=1,g=2,b=3, #band numbers within the imagery
+           start=1)
+```
+
+Finally all the tiles converted in a binary classification; 0 if there was no bare peat present and 1 if there was bare peat present. This was converted to the 10m pixel level as a percentage cover per 10m of bare peat.
+
+```{r, eval=FALSE}
+
+options("rgdal_show_exportToProj4_warnings"="none")
+source("pcovClassify.R")
+dirpath <- 'PeatlandCondition/'
+
+tictoc::tic()
+#convert into percentage covers
+pcov_classify(img_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Masked/2019/'), 
+              bare_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/Bare/2019/'),
+              out_path=paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/'),
+              polymask=paste0(dirpath,'NE_HumberheadNNR/Shapefile/Humberhead_Site_Boundaries.shp'))
+
+# mosaic tiles
+pcov <- list.files(paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/bare_pcov/'),full.names=T)
+pcov_list <- purrr::map(pcov,raster)
+names(pcov_list)<-NULL
+pcov_list$fun <- mean
+pcov_mosaic <- do.call(raster::mosaic,c(pcov_list,progress="window"))
+raster::writeRaster(pcov_mosaic,paste0(dirpath,'NE_HumberheadNNR/Fine_scale_mapping/Hatfield/bare_pcov_mosaic.tif'))
+
+# finished message
+sink(fs::path(dirpath, 'NE_HumberheadNNR','Fine_scale_mapping', 'Hatfield', 'FINISHED.txt'))
+lubridate::now()
+tictoc::toc()
+sink()
+```
+
+
+
+

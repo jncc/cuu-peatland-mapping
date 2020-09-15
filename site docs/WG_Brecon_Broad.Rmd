@@ -1,0 +1,596 @@
+---
+title: "CUUPeat: Brecon Beacons, Wales - Broad-scale bare peat mapping"
+date: "15/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# Built with r 3.6.0
+library(tmap)
+library(raster)
+library(dplyr)
+library(sf)
+library(stringr)
+library(gdalUtils)
+library(purrr)
+library(JNCCsdms)
+
+#package dependencies
+# JNCCsdms_0.1.0    stringr_1.4.0    
+# purrr_0.3.4       gdalUtils_2.0.3.2
+# tmap_3.0          sf_0.9-2         
+# dplyr_0.8.5       raster_3.0-7     
+# sp_1.4-2 
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Welsh Government - Brecon Beacons, Wales
+Broad-scale bare peat mapping processing
+
+
+## Site location
+
+```{r sitemap,message=F,warning=F}
+
+#site boundaries
+site <- sf::st_read('Breacon_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('Proposed_S2_AOI.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('Proposed_APGB_AOI.shp',quiet=T)
+
+#plot
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green") +
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+
+## Preparing Variable layers
+
+### DTM and slope
+
+```{r dtmslopevars, eval = FALSE}
+
+projfolder <- 'PeatlandCondition/'
+
+#crop dtm to AOI
+dtm <- raster::raster('UK_DEM_Composite_10m_WGS84.tif')
+AOI= sf::st_read(paste0(projfolder,'Data/Site_AOIs/WG_Beacons/Proposed_S2_AOI.shp'),quiet=T)
+
+# reproject AOI
+AOI_WGS84 <- AOI %>% sf::st_transform(4326)
+
+#crop to dtm
+dtm_crop <-raster::crop(dtm,AOI_WGS84)
+dtm_bng <- raster::projectRaster(dtm_crop, crs=sp::CRS('+init=epsg:27700'), method='bilinear')
+raster::writeRaster(dtm_bng,paste0(projfolder,'WG_BreconBeacons/Variable_layers/WG_BB_dtm.tif'),overwrite=T)
+
+# we can then create a slope layer using gdalutils
+gdalUtils::gdal_setInstallation()
+gdalUtils::gdaldem(mode="slope",
+                     input_dem=paste0(projfolder,'WG_BreconBeacons/Variable_layers/WG_BB_dtm.tif'),
+                     output=paste0(projfolder,'WG_BreconBeacons/Variable_layers/WG_BB_slope.tif'),
+                    ,verbose=T)
+
+```
+
+### Climate layers
+
+```{r prepclimate,eval=F}
+#list all data files from met office
+met_files <- data.frame(files=list.files("MetOffice_HadUK_monthly_grid_1km/",pattern='.nc'))
+#subset to seasonal records
+met_season <- met_files %>% dplyr::filter(stringr::str_detect(files, "Seas"))
+#iterate through taking just the summer season data
+out<- purrr:::map(met_season$files,function(metlayer){
+  met_raw <- raster::brick(paste0("MetOffice_HadUK_monthly_grid_1km/",as.character(metlayer)))
+  summer <- met_raw[[3]]
+  summer_crop <-raster::crop(summer,AOI)
+  #get filename of measure and year
+  filename_split <- stringr::str_split(gsub(as.character(metlayer),pattern="Had",replacement="_Had"),pattern='_')
+filename <- paste0(stringr::str_extract(as.character(filename_split[[1]][4]),'\\d{4}'),'_',filename_split[[1]][2])
+#write out
+  raster::writeRaster(summer_crop, paste0(projfolder,'WG_BreconBeacons/Variable_layers/WG_BB_',filename,'.tif'),overwrite=T)
+  summer_crop
+})
+
+
+#create a mean layer for use with years without data released - 2019,2020
+vars <- c("rainfall","tas","tasmin","tasmax")
+# iterate through each variable
+all <- purrr::map(vars, .f=function(var){
+  varfiles <- list.files(paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),full.name=T,pattern=var) # list all files in that folder for variable
+  varfiles_r <- purrr::map(varfiles, raster::raster) #load
+  varstack <- raster::stack(varfiles_r) #stack 
+  varmean <- raster::calc(varstack,mean) #mean
+  raster::writeRaster(varmean,paste0(projfolder,'WG_BreconBeacons/Variable_layers/WG_BB_mean_',var,'.tif')) #write out
+})
+
+```
+
+
+
+### Sentinel imagery and calculating indices
+
+extraction time series: 
+* S2A_20170525_lat52lon366_T30UVC_ORB037_utm30n_osgb	2017-05-25
+* S2B_20180505_lat52lon366_T30UVC_ORB037_utm30n_osgb	2018-05-05
+
+
+Modelling time series:
+* 2016	S2A_20160719_lat52lon366_T30UVC_ORB037_utm30n_osgb	2016-07-19
+* 2017	S2A_20170525_lat52lon366_T30UVC_ORB037_utm30n_osgb	2017-05-25
+* 2018	S2A_20180629_lat52lon366_T30UVC_ORB037_utm30n_osgb	2018-06-29
+* 2019	S2B_20190420_lat52lon366_T30UVC_ORB037_utm30n_osgb	2019-04-20
+* 2020	S2B_20200623_lat52lon366_T30UVC_ORB037_utm30n_osgb	2020-06-23
+
+
+```{r, eval=F}
+projfolder <- 'PeatlandCondition/'
+
+#prep and crop sentinel imagery to new AOI
+s2_processing(s2path=paste0(projfolder,"Data/Sentinel-2/WG_BB/"),
+              out_folder = paste0(projfolder,"WG_BreconBeacons/Variable_layers/"),
+              nirband=8,rband=3,bband=1,gband=2,swirband=9,
+              indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+              )
+```
+
+
+## Compiling Variable Stacks
+
+```{r,eval=F}
+# create varstacks and mask
+
+# do this for the highly probable peat crop as well as the probable peat
+
+### highly probable peat ###
+# extraction varstack: 2017-05-25 (same as 2017 time series)
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20170525_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2017_rainfall.tif',
+                    'WG_BB_2017_tas.tif',
+                    'WG_BB_2017_tasmin.tif',
+                    'WG_BB_2017_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp)',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2017')
+# extraction varstack: 2018-05-052018-05-05
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180505_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2018_extract')
+# 2016 varstack: 2016-07-19
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20160719_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2016_rainfall.tif',
+                    'WG_BB_2016_tas.tif',
+                    'WG_BB_2016_tasmin.tif',
+                    'WG_BB_2016_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2016')
+# 2018 varstack: 2018-06-29
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180629_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2018')
+# 2019 varstack: 2019-04-20
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20190420_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2019')
+# 2020 varstack: 2020-06-23
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20200623_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2020')
+
+### probable peat ###
+# extraction varstack: 2017-05-25 (same as 2017 time series)
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20170525_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2017_rainfall.tif',
+                    'WG_BB_2017_tas.tif',
+                    'WG_BB_2017_tasmin.tif',
+                    'WG_BB_2017_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2017')
+# extraction varstack: 2018-05-052018-05-05
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180505_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2018_extract')
+# 2016 varstack: 2016-07-19
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20160719_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2016_rainfall.tif',
+                    'WG_BB_2016_tas.tif',
+                    'WG_BB_2016_tasmin.tif',
+                    'WG_BB_2016_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2016')
+# 2018 varstack: 2018-06-29
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180629_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2018')
+# 2019 varstack: 2019-04-20
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20190420_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2019')
+# 2020 varstack: 2020-06-23
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20200623_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'fine_peat_soils.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/'),
+             stackname='WG_BreconBeacons_2020')
+
+
+#### probable peat###
+# extraction varstack: 2017-05-25 (same as 2017 time series)
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20170525_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2017_rainfall.tif',
+                    'WG_BB_2017_tas.tif',
+                    'WG_BB_2017_tasmin.tif',
+                    'WG_BB_2017_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2017')
+# extraction varstack: 2018-05-052018-05-05
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180505_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2018_extract')
+# 2016 varstack: 2016-07-19
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20160719_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2016_rainfall.tif',
+                    'WG_BB_2016_tas.tif',
+                    'WG_BB_2016_tasmin.tif',
+                    'WG_BB_2016_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2016')
+# 2018 varstack: 2018-06-29
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20180629_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_2018_rainfall.tif',
+                    'WG_BB_2018_tas.tif',
+                    'WG_BB_2018_tasmin.tif',
+                    'WG_BB_2018_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2018')
+# 2019 varstack: 2019-04-20
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20190420_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2019')
+# 2020 varstack: 2020-06-23
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'WG_BreconBeacons/Variable_layers/'),
+             satimg='SEN2_20200623_lat52lon366_T30UVC_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_BreconBeacons_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('WG_BB_mean_rainfall.tif',
+                    'WG_BB_mean_tas.tif',
+                    'WG_BB_mean_tasmin.tif',
+                    'WG_BB_mean_tasmax.tif',
+                    'WG_BB_slope.tif'),
+             mask= 'CUU_WG_Peat_Area_of_Interest_Data.shp',
+             outpath = paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/'),
+             stackname='WG_BreconBeacons_2020')
+
+```
+
+## Extracting training data
+
+```{r,eval=F}
+# Two dates needed: 2017 and 2018 
+# 2017-05-25
+train_extract(varstack=paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/WG_BreconBeacons_2017.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'APGB/WG_BB/Combined/bare_pcov_mosaic_2017.tif'),
+              outfolder=paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+
+# 2018-05-05
+train_extract(varstack=paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/highlyprobablepeat/WG_BreconBeacons_2018_extract.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'Data/APGB/WG_BB/Combined/bare_pcov_mosaic_2018.tif'),
+              outfolder=paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+```
+
+## Running the time series regression models
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+training1 <- read.csv(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017.csv")) %>% dplyr::select(-X)
+training2 <- read.csv(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2018_extract.csv")) %>% dplyr::select(-X)
+alltrain <- rbind(training1,training2)
+write.csv(alltrain,paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017_2018.csv"))
+
+## look at how many per category
+alltrain %>% group_by(barecat) %>% summarise(n=n())
+
+
+## covariate analysis
+varstack <- raster::stack(paste0(projfolder,'WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/WG_BreconBeacons_2017.tif'))
+names(varstack) <-c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope')
+# run  function to see how the variables correlate
+JNCCsdms::corrVars(varstack)
+
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017_2018.csv"),
+      varpredict=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017 & 2018/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=5000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+```
+
+
+
+## Assessing change over time
+
+
+```{r,eval=F}
+dir.create(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017 & 2018/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017 & 2018/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:4],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:5],names(pred_tifs)[5]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('WG_BreconBeacons',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017 & 2018/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+
+```
+
+
+# rerunning on just 2017 data with 5000 points
+
+```{r,eval=F}
+## Running the time series regression models
+projfolder <- 'PeatlandCondition/'
+
+## combine data years
+training <- read.csv(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017.csv")) 
+## look at how many per category
+training %>% group_by(barecat) %>% summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017.csv"),
+      varpredict=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=5000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# running the change analysis
+dir.create(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:4],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:5],names(pred_tifs)[5]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('WG_BreconBeacons',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+```
+
+
+
+# rerunning on just 2017 data with 2000 points
+
+```{r,eval=F}
+## Running the time series regression models
+## combine data years
+training <- read.csv(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017.csv")) 
+## look at how many per category
+training %>% group_by(barecat) %>% summarise(n=n())
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Training_data/WG_BreconBeacons_2017.csv"),
+      varpredict=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/Varstacks/probablepeat/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017_2000points/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=2000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+# running the change analysis
+dir.create(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017_2000points/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017_2000points/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:4],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:5],names(pred_tifs)[5]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('WG_BreconBeacons',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"WG_BreconBeacons/Time_series_modelling/RegressionModels/2017_2000points/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+```
+
+
+

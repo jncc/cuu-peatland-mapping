@@ -1,0 +1,300 @@
+---
+title: "CUUPeat: Dark Peak - Broad-scale bare peat mapping"
+date: "14/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(tmap)
+library(raster)
+library(dplyr)
+library(sf)
+library(stringr)
+library(gdalUtils)
+library(purrr)
+library(JNCCsdms)
+
+#package dependencies
+# JNCCsdms_0.1.0    stringr_1.4.0    
+# purrr_0.3.4       gdalUtils_2.0.3.2
+# tmap_3.0          sf_0.9-2         
+# dplyr_0.8.5       raster_3.0-7     
+# sp_1.4-2 
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Natural England site - Dark Peak, England
+
+
+## Site location
+
+```{r sitemap,eval=F}
+#site boundaries
+site <- sf::st_read('NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp',quiet=T)
+#S2 AOI
+S2 <- sf::st_read('NE_DarkPeak/DarkPeak_S2_AOI.shp',quiet=T)
+#APGB AOI
+APGB <- sf::st_read('NE_DarkPeak/DarkPeak_APGB_AOI.shp',quiet=T)
+
+#plot
+tmap::tmap_mode("view")
+tmap::tm_shape(site) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green") +
+  tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') +
+  tmap::tm_shape(APGB) +  tmap::tm_borders(alpha=1,col='pink')
+
+
+```
+
+## Preparing Variable layers
+
+### DTM and slope
+
+
+```{r dtmslopevars, eval = FALSE}
+
+projfolder <- 'PeatlandCondition/'
+
+#crop dtm to AOI
+dtm <- raster::raster('UK_DEM_Composite_10m_WGS84.tif')
+AOI= sf::st_read(paste0(projfolder,'Data/Site_AOIs/NE_DarkPeak/DarkPeak_S2_AOI.shp'),quiet=T)
+
+# reproject AOI
+AOI_WGS84 <- AOI %>% sf::st_transform(4326)
+
+#crop to dtm
+dtm_crop <-raster::crop(dtm,AOI_WGS84)
+dtm_bng <- raster::projectRaster(dtm_crop, crs=sp::CRS('+init=epsg:27700'), method='bilinear')
+raster::writeRaster(dtm_bng,paste0(projfolder,'NE_DarkPeak/Variable_layers/NE_DP_dtm.tif'),overwrite=T)
+
+# we can then create a slope layer using gdalutils
+gdalUtils::gdal_setInstallation()
+gdalUtils::gdaldem(mode="slope",
+                     input_dem=paste0(projfolder,'NE_DarkPeak/Variable_layers/NE_DP_dtm.tif'),
+                     output=paste0(projfolder,'NE_DarkPeak/Variable_layers/NE_DP_slope.tif'),
+                    ,verbose=T)
+
+```
+
+
+
+### Climate layers
+
+```{r prepclimate,eval=F}
+#list all data files from met office
+met_files <- data.frame(files=list.files("MetOffice_HadUK_monthly_grid_1km/",pattern='.nc'))
+#subset to seasonal records
+met_season <- met_files %>% dplyr::filter(stringr::str_detect(files, "Seas"))
+#iterate through taking just the summer season data
+out<- purrr:::map(met_season$files,function(metlayer){
+  met_raw <- raster::brick(paste0("MetOffice_HadUK_monthly_grid_1km/",as.character(metlayer)))
+  summer <- met_raw[[3]]
+  summer_crop <-raster::crop(summer,AOI)
+  #get filename of measure and year
+  filename_split <- stringr::str_split(gsub(as.character(metlayer),pattern="Had",replacement="_Had"),pattern='_')
+filename <- paste0(stringr::str_extract(as.character(filename_split[[1]][4]),'\\d{4}'),'_',filename_split[[1]][2])
+#write out
+  raster::writeRaster(summer_crop, paste0(projfolder,'NE_DarkPeak/Variable_layers/NE_DP_',filename,'.tif'),overwrite=T)
+  summer_crop
+})
+
+
+
+#create a mean layer for use with years without data released - 2019,2020
+vars <- c("rainfall","tas","tasmin","tasmax")
+# iterate through each variable
+all <- purrr::map(vars, .f=function(var){
+  varfiles <- list.files(paste0(projfolder,'NE_DarkPeak/Variable_layers/'),full.name=T,pattern=var) # list all files in that folder for variable
+  varfiles_r <- purrr::map(varfiles, raster::raster) #load
+  varstack <- raster::stack(varfiles_r) #stack 
+  varmean <- raster::calc(varstack,mean) #mean
+  raster::writeRaster(varmean,paste0(projfolder,'NE_DarkPeak/Variable_layers/NE_DP_mean_',var,'.tif')) #write out
+})
+
+```
+
+### Sentinel imagery and calculating indices
+
+extraction time series: 
+* S2A_20180629_lat54lon217_T30UWE_ORB037_utm30n_osgb	2018-06-29
+
+Modelling time series:
+* 2016	 S2A_20160719_lat54lon217_T30UWE_ORB037_utm30n_osgb	2016-07-19
+* 2017	S2B_20171027_lat54lon217_T30UWE_ORB037_utm30n_osgb	2017-10-27
+* 2018	S2A_20180629_lat54lon217_T30UWE_ORB037_utm30n_osgb	2018-06-29
+* 2019	S2A_20190422_lat54lon217_T30UWE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref	2019-04-22
+*  2020	S2A_20200625_lat54lon217_T30UWE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref	2020-06-25
+
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+#prep S2 imagery  
+s2_processing(s2path=paste0(projfolder,"Data/Sentinel-2/NE_DarkPeak/"),
+              out_folder = paste0(projfolder,"NE_DarkPeak/Variable_layers/"),
+              nirband=8,rband=3,bband=1,gband=2,swirband=9,
+              indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+              cropAOI=NA)
+
+```
+
+## Compiling Variable Stacks
+
+```{r,eval=F}
+# create varstacks and mask
+
+# extraction varstack: 2018-06-29 (same img as 2018 in time series)
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'NE_DarkPeak/Variable_layers/'),
+             satimg='SEN2_20180629_lat54lon217_T30UWE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_DarkPeak_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_DP_2018_rainfall.tif',
+                    'NE_DP_2018_tas.tif',
+                    'NE_DP_2018_tasmin.tif',
+                    'NE_DP_2018_tasmax.tif',
+                    'NE_DP_slope.tif'),
+             mask= paste0(projfolder,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp'),
+             outpath = paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/'),
+             stackname='NE_DP_2018')
+
+# 2016 varstack: 2016-07-19
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'NE_DarkPeak/Variable_layers/'),
+             satimg='SEN2_20160719_lat54lon217_T30UWE_ORB037_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_DarkPeak_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_DP_2016_rainfall.tif',
+                    'NE_DP_2016_tas.tif',
+                    'NE_DP_2016_tasmin.tif',
+                    'NE_DP_2016_tasmax.tif',
+                    'NE_DP_slope.tif'),
+             mask= paste0(projfolder,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp'),
+             outpath = paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/'),
+             stackname='NE_DP_2016')
+
+# 2017 varstack: 2017-10-27
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'NE_DarkPeak/Variable_layers/'),
+             satimg='SEN2_20171029_lat54lon217_T30UWE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_DarkPeak_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_DP_2017_rainfall.tif',
+                    'NE_DP_2017_tas.tif',
+                    'NE_DP_2017_tasmin.tif',
+                    'NE_DP_2017_tasmax.tif',
+                    'NE_DP_slope.tif'),
+             mask= paste0(projfolder,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp'),
+             outpath = paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/'),
+             stackname='NE_DP_2017')
+
+# 2019 varstack: 2019-04-22
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'NE_DarkPeak/Variable_layers/'),
+             satimg='SEN2_20190422_lat54lon217_T30UWE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_DarkPeak_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_DP_mean_rainfall.tif',
+                    'NE_DP_mean_tas.tif',
+                    'NE_DP_mean_tasmin.tif',
+                    'NE_DP_mean_tasmax.tif',
+                    'NE_DP_slope.tif'),
+             mask= paste0(projfolder,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp'),
+             outpath = paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/'),
+             stackname='NE_DP_2019')
+
+# 2020 varstack: 2020-06-25
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'NE_DarkPeak/Variable_layers/'),
+             satimg='SEN2_20200625_lat54lon217_T30UWE_ORB137_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_DarkPeak_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('NE_DP_mean_rainfall.tif',
+                    'NE_DP_mean_tas.tif',
+                    'NE_DP_mean_tasmin.tif',
+                    'NE_DP_mean_tasmax.tif',
+                    'NE_DP_slope.tif'),
+             mask= paste0(projfolder,'NE_DarkPeak/Shapefiles/DarkPeak_Site_Boundaries.shp'),
+             outpath = paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/'),
+             stackname='NE_DP_2020')
+
+```
+
+
+## Extracting training data
+
+```{r,eval=F}
+# For DP site there was only one year of training data in 2018
+train_extract(varstack=paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/NE_DP_2018.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+              trainr=paste0(projfolder,'NE_DarkPeak/Fine_scale_mapping/bare_pcov_mosaic.tif'),
+              outfolder=paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+```
+
+## Running the time series regression models
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## look at how many per category
+training <- read.csv(paste0(projfolder,"NE_DarkPeak/Time_series_modelling/Training_data/NE_DP_2018.csv"))
+training %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+
+## covariate analysis
+varstack <- raster::stack(paste0(projfolder,'NE_DarkPeak/Time_series_modelling/Varstacks/FR_CES_2016.tif'))
+names(varstack) <-c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope')
+# run  function to see how the variables correlate
+JNCCsdms::corrVars(varstack)
+
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"NE_DarkPeak/Time_series_modelling/Training_data/NE_DP_2018.csv"),
+      varpredict=paste0(projfolder,"NE_DarkPeak/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"NE_DarkPeak/Time_series_modelling/RegressionModels/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+```
+
+## Assessing change over time
+
+```{r,eval=F}
+dir.create(paste0(projfolder,"NE_DarkPeak/Time_series_modelling/RegressionModels/ChangeMaps"))
+
+pred_maps <- list.files(paste0(projfolder,"NE_DarkPeak/Time_series_modelling/RegressionModels/Outputs/"),
+                        pattern='.tif',full.names = T)
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:4],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:5],names(pred_tifs)[5]))
+
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('NE_DarkPeak',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"NE_DarkPeak/Time_series_modelling/RegressionModels/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+
+```

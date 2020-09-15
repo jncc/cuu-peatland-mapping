@@ -1,0 +1,329 @@
+---
+title: "CUUPeat: Caithness and East Sutherland, Scotland - Broad-scale bare peat mapping"
+date: "14/09/2020"
+output:
+  html_document:
+    df_print: paged
+    css: style.css
+    includes:
+      before_body: header.html
+  pdf_document: default
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE,echo=F}
+
+knitr::opts_chunk$set(echo = TRUE)
+# Built with r 3.6.0
+library(raster)
+library(dplyr)
+library(sf)
+library(dplyr)
+library(tmap)
+library(stringr)
+library(JNCCsdms)
+library(tmap)
+library(purrr)
+library(gdalUtils)
+library(sp)
+
+#dependencies
+# JNCCsdms_0.1.0    stringr_1.4.0    
+# purrr_0.3.4       gdalUtils_2.0.3.2
+# tmap_3.0          sf_0.9-2         
+# dplyr_0.8.5       raster_3.0-7     
+# sp_1.4-2
+
+```
+
+<div class="mycontent">
+
+CUU Peat Project - Forest Research site - Caithness and East Sutherland, Scotland
+Broad-scale bare peat mapping processing
+
+
+## Site location
+
+```{r sitemap,message=F,warning=F,eval=F}
+
+#new S2 AOI
+newAOI <- sf::st_read('Dalchork_APGB_AOI.shp') %>% dplyr::filter(id==1)
+sf::st_write(newAOI, 'Dalchork_S2_AOI_new.shp')
+S2 <- newAOI
+
+
+#site boundaries
+site <- sf::st_read('CES_Site_Boundaries.shp',quiet=T) 
+site_1 <- sf::st_intersection(site,newAOI)
+
+library(tmap)
+tmap::tmap_mode("view")
+
+tmap::tm_shape(site_1) +  tmap::tm_borders(alpha=0.5) +  tmap::tm_fill("green")+
+tmap::tm_shape(S2) +  tmap::tm_borders(alpha=1,col='blue') 
+
+
+```
+
+
+## Preparing Variable layers
+
+### DTM and slope
+
+```{r dtmslopevars, eval = FALSE}
+
+
+projfolder <- 'PeatlandCondition/'
+
+#crop dtm to AOI
+dtm <- raster::raster('UK_DEM_Composite_10m_WGS84.tif')
+AOI= sf::st_read('Dalchork_S2_AOI_new.shp',quiet=T)
+
+# reproject AOI
+AOI_WGS84 <- AOI %>% sf::st_transform(4326)
+
+#crop to dtm
+dtm_crop <-raster::crop(dtm,AOI_WGS84)
+dtm_bng <- raster::projectRaster(dtm_crop, crs=sp::CRS('+init=epsg:27700'), method='bilinear')
+
+raster::writeRaster(dtm_bng,paste0(projfolder,'FR_CES/Variable_layers/FR_CES_dtm.tif'),overwrite=T)
+
+# we can then create a slope layer using gdalutils
+  gdalUtils::gdal_setInstallation()
+  gdalUtils::gdaldem(mode="slope",
+                     input_dem=paste0(projfolder,'FR_CES/Variable_layers/FR_CES_dtm.tif'),
+                     output=paste0(projfolder,'FR_CES/Variable_layers/FR_CES_slope.tif'),
+                    ,verbose=T)
+
+```
+
+### Climate layers
+
+```{r prepclimate,eval=F}
+
+#list all data files from met office
+met_files <- data.frame(files=list.files("MetOffice_HadUK_monthly_grid_1km/",pattern='.nc'))
+#subset to seasonal records
+met_season <- met_files %>% dplyr::filter(stringr::str_detect(files, "Seas"))
+#iterate through taking just the summer season data
+out<- purrr:::map(met_season$files,function(metlayer){
+  met_raw <- raster::brick(paste0("MetOffice_HadUK_monthly_grid_1km/",as.character(metlayer)))
+  summer <- met_raw[[3]]
+  summer_crop <-raster::crop(summer,AOI)
+  #get filename of measure and year
+  filename_split <- stringr::str_split(gsub(as.character(metlayer),pattern="Had",replacement="_Had"),pattern='_')
+filename <- paste0(stringr::str_extract(as.character(filename_split[[1]][4]),'//d{4}'),'_',filename_split[[1]][2])
+#write out
+  raster::writeRaster(summer_crop, paste0(projfolder,'FR_CES/Variable_layers/FR_CES_',filename,'.tif'),overwrite=T)
+  
+})
+
+#create a mean layer for use with years without data released - 2019,2020
+vars <- c("rainfall","tas","tasmin","tasmax")
+# iterate through each variable
+all <- purrr::map(vars, .f=function(var){
+  varfiles <- list.files(paste0(projfolder,'FR_CES/Variable_layers/'),full.name=T,pattern=var) # list all files in that folder for variable
+  varfiles_r <- purrr::map(varfiles, raster::raster) #load
+  varstack <- raster::stack(varfiles_r) #stack 
+  varmean <- raster::calc(varstack,mean) #mean
+  raster::writeRaster(varmean,paste0(projfolder,'FR_CES/Variable_layers/FR_CES_mean_',var,'.tif')) #write out
+})
+
+
+```
+
+
+### Masking Sentinel imagery and calculating indices
+
+extraction time series: 
+*	2016-06-05 - S2A_20160605_lat58lon377_T30VVK_ORB123_utm30n_osgb
+	
+Modelling time series
+
+* 2015	S2A_20150929_lat58lon377_T30VVK_ORB123_utm30n_osgb	2015-09-29
+* 2016	S2A_20160605_lat58lon377_T30VVK_ORB123_utm30n_osgb	2016-06-05
+* 2017	s3://sentinel-s2-l2a/tiles/30/V/VK/2017/9/23/0      2017-09-23
+* 2018	s3://sentinel-s2-l2a/tiles/30/V/VK/2018/6/30/0	    2018-06-30
+* 2019	S2A_20190826_lat58lon377_T30VVK_ORB080_utm30n_osgb	2019-08-26
+* 2020	s3://sentinel-s2-l2a/tiles/30/V/VK/2020/5/07/0	    2020-05-07
+
+
+```{r, eval=F}
+projfolder <- 'PeatlandCondition/'
+
+#prep and crop sentinel imagery to new AOI
+s2_processing(s2path=paste0(projfolder,"Data/Sentinel-2/FR_Dalchork/"),
+              out_folder = paste0(projfolder,"FR_CES/Variable_layers/"),
+              nirband=8,rband=3,bband=1,gband=2,swirband=9,
+              indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+              cropAOI=paste0(projfolder,'Data/Site_AOIs/FR_Dalchork/Dalchork_S2_AOI_new.shp')
+
+```
+
+
+## Compiling Variable Stacks
+
+```{r,eval=F}
+# create varstacks and mask
+
+# extraction varstack: 2016-06-05 (same img as 2016 in time series)
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip, slope
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20160605_lat58lon377_T30VVK_ORB123_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_2016_rainfall.tif',
+                    'FR_CES_2016_tas.tif',
+                    'FR_CES_2016_tasmin.tif',
+                    'FR_CES_2016_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2016')
+
+# 2015 varstack: 2015-09-29
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20150929_lat58lon377_T30VVK_ORB123_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_2015_rainfall.tif',
+                    'FR_CES_2015_tas.tif',
+                    'FR_CES_2015_tasmin.tif',
+                    'FR_CES_2015_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2015')
+
+# 2017 varstack: 2017-09-23
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20170923_lat58lon377_T30VVK_ORB123_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_2017_rainfall.tif',
+                    'FR_CES_2017_tas.tif',
+                    'FR_CES_2017_tasmin.tif',
+                    'FR_CES_2017_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2017')
+
+# 2018 varstack: 2018-06-30
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20180630_lat58lon377_T30VVK_ORB123_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_2018_rainfall.tif',
+                    'FR_CES_2018_tas.tif',
+                    'FR_CES_2018_tasmin.tif',
+                    'FR_CES_2018_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2018')
+
+# 2019 varstack: 2019-08-26
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20190826_lat58lon377_T30VVK_ORB080_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_mean_rainfall.tif',
+                    'FR_CES_mean_tas.tif',
+                    'FR_CES_mean_tasmin.tif',
+                    'FR_CES_mean_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2019')
+
+# 2020 varstack: 2020-05-07
+#varstacks:"Brightness","NDVI","RG","RB","NBR","NDWI","GLI", nir band, average seasonal temp, max seasonal temp, precip
+sat_varstack(varpath = paste0(projfolder,'FR_CES/Variable_layers/'),
+             satimg='SEN2_20200507_lat58lon377_T30VVK_ORB080_utm30n_osgb_vmsk_sharp_rad_srefdem_stdsref_Dalchork_msk.tif',
+             satbands=8,
+             indices=c("Brightness","NDVI","RG","RB","NBR","NDWI","GLI"),
+             vars=c('FR_CES_mean_rainfall.tif',
+                    'FR_CES_mean_tas.tif',
+                    'FR_CES_mean_tasmin.tif',
+                    'FR_CES_mean_tasmax.tif',
+                    'FR_CES_slope.tif'),
+             mask= paste0(projfolder,'FR_CES/Shapefiles/CES_Site1_nonPlanted.shp'),
+             outpath = paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/'),
+             stackname='FR_CES_2020')
+```
+
+## Extracting training data
+
+```{r,eval=F}
+# For FR site only one closest date for the 2016 training data 
+train_extract(varstack=paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/FR_CES_2016.tif'),
+              varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",'slope'),
+              trainr=paste0(projfolder,'FR_CES/Fine_scale_mapping/bare_pcov_mosaic.tif'),
+              outfolder=paste0(projfolder,'FR_CES/Time_series_modelling/Training_data/'),
+              stratified = T)
+
+```
+
+
+## Running the time series regression models
+
+
+```{r,eval=F}
+projfolder <- 'PeatlandCondition/'
+
+## look at how many per category
+training <- read.csv(paste0(projfolder,"FR_CES/Time_series_modelling/Training_data/FR_CES_2016.csv"))
+training %>% dplyr::group_by(barecat) %>% dplyr::summarise(n=n())
+
+
+## covariate analysis
+varstack <- raster::stack(paste0(projfolder,'FR_CES/Time_series_modelling/Varstacks/FR_CES_2016.tif'))
+names(varstack) <-c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope')
+# run  function to see how the variables correlate
+JNCCsdms::corrVars(varstack)
+
+
+## train models and run predictions
+RFReg(training=paste0(projfolder,"FR_CES/Time_series_modelling/Training_data/FR_CES_2016.csv"),
+      varpredict=paste0(projfolder,"FR_CES/Time_series_modelling/Varstacks/"),
+      varnames=c("NIRBand","Brightness","NDVI","RG","RB","NBR","NDWI","GLI","rainfall","av_temp","min_temp","max_temp",
+                    'slope'),
+      out.folder=paste0(projfolder,"FR_CES/Time_series_modelling/RegressionModels/"),
+      max_tries=10,
+      prop.test=0.25,
+      nsamp=10000, 
+      resamp=5,
+      stratified=T,fillsamp=F)
+
+```
+
+## Assessing change over time
+
+```{r,eval=F}
+#create folder to save outputs
+dir.create(paste0(projfolder,"FR_CES/Time_series_modelling/RegressionModels/ChangeMaps"))
+#list all predicted maps
+pred_maps <- list.files(paste0(projfolder,"FR_CES/Time_series_modelling/RegressionModels/Outputs/"),
+                        pattern='.tif',full.names = T)
+#load in all maps
+pred_tifs <- purrr::map(pred_maps,raster::raster)
+#get year names
+names(pred_tifs) <- gsub('.tif',basename(pred_maps),replacement="")
+#make comparison table
+year_combo <- data.frame(startyear=c(names(pred_tifs)[1:5],names(pred_tifs)[1]),endyear=c(names(pred_tifs)[2:6],names(pred_tifs)[6]))
+#iterate through comparison table calculating end-start to get change 
+purrr::map2(as.character(year_combo$startyear),as.character(year_combo$endyear),.f=function(x,y){
+  start_bare <- pred_tifs[[x]]
+  end_bare <- pred_tifs[[y]]
+  change_bare <-raster::overlay(start_bare,end_bare,fun=function(x,y){y-x}) 
+  endyear <- gsub('_barepeat',gsub('FR_CES',y,replacement=''),replacement='')
+  raster::writeRaster(change_bare,paste0(projfolder,"FR_CES/Time_series_modelling/RegressionModels/ChangeMaps/",x,endyear,'change.tif'),overwrite=T)
+})
+
+```
