@@ -1,6 +1,8 @@
 ---
 title: "CUUPeat: Brecon Beacons, Wales - Broad-scale bare peat mapping"
 date: "15/09/2020"
+author: 'JNCC'
+licence: 'MIT Licence'
 output:
   html_document:
     df_print: paged

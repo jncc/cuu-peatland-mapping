@@ -9,7 +9,9 @@
 ##
 ## Date Modified: 2020-09-10
 ##
-## Licence: JNCC
+## Author: JNCC
+##
+## Licence: MIT licence
 ##
 ##
 ## Abstract: Script to prepare the S2 and bare peat layers for use in the Bare Peat Mapper app.
